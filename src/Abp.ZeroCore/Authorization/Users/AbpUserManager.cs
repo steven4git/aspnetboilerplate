@@ -1,13 +1,17 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 using Abp.Application.Features;
 using Abp.Authorization.Roles;
 using Abp.Configuration;
+using Abp.Configuration.Startup;
 using Abp.Domain.Repositories;
 using Abp.Domain.Services;
 using Abp.Domain.Uow;
+using Abp.Json;
 using Abp.Localization;
 using Abp.MultiTenancy;
 using Abp.Organizations;
@@ -16,10 +20,10 @@ using Abp.Runtime.Session;
 using Abp.UI;
 using Abp.Zero;
 using Abp.Zero.Configuration;
-using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
+using Newtonsoft.Json;
 
 namespace Abp.Authorization.Users
 {
@@ -42,13 +46,17 @@ namespace Abp.Authorization.Users
 
         public ILocalizationManager LocalizationManager { get; set; }
 
+        protected string LocalizationSourceName { get; set; }
+
         public IAbpSession AbpSession { get; set; }
 
         public FeatureDependencyContext FeatureDependencyContext { get; set; }
 
         protected AbpRoleManager<TRole, TUser> RoleManager { get; }
 
-        public AbpUserStore<TRole, TUser> AbpStore { get; }
+        protected AbpUserStore<TRole, TUser> AbpUserStore { get; }
+
+        public IMultiTenancyConfig MultiTenancy { get; set; }
 
         private readonly IPermissionManager _permissionManager;
         private readonly IUnitOfWorkManager _unitOfWorkManager;
@@ -57,10 +65,11 @@ namespace Abp.Authorization.Users
         private readonly IRepository<UserOrganizationUnit, long> _userOrganizationUnitRepository;
         private readonly IOrganizationUnitSettings _organizationUnitSettings;
         private readonly ISettingManager _settingManager;
+        private readonly IOptions<IdentityOptions> _optionsAccessor;
 
         public AbpUserManager(
             AbpRoleManager<TRole, TUser> roleManager,
-            AbpUserStore<TRole, TUser> store,
+            AbpUserStore<TRole, TUser> userStore,
             IOptions<IdentityOptions> optionsAccessor,
             IPasswordHasher<TUser> passwordHasher,
             IEnumerable<IUserValidator<TUser>> userValidators,
@@ -77,7 +86,7 @@ namespace Abp.Authorization.Users
             IOrganizationUnitSettings organizationUnitSettings,
             ISettingManager settingManager)
             : base(
-                store,
+                userStore,
                 optionsAccessor,
                 passwordHasher,
                 userValidators,
@@ -94,9 +103,12 @@ namespace Abp.Authorization.Users
             _userOrganizationUnitRepository = userOrganizationUnitRepository;
             _organizationUnitSettings = organizationUnitSettings;
             _settingManager = settingManager;
+            _optionsAccessor = optionsAccessor;
 
-            AbpStore = store;
+            AbpUserStore = userStore;
             RoleManager = roleManager;
+            LocalizationManager = NullLocalizationManager.Instance;
+            LocalizationSourceName = AbpZeroConsts.LocalizationSourceName;
         }
 
         public override async Task<IdentityResult> CreateAsync(TUser user)
@@ -113,7 +125,15 @@ namespace Abp.Authorization.Users
                 user.TenantId = tenantId.Value;
             }
 
-            return await base.CreateAsync(user);
+            var isLockoutEnabled = user.IsLockoutEnabled;
+
+            var identityResult = await base.CreateAsync(user);
+            if (identityResult.Succeeded)
+            {
+                await SetLockoutEnabledAsync(user, isLockoutEnabled);
+            }
+
+            return identityResult;
         }
 
         /// <summary>
@@ -147,14 +167,16 @@ namespace Abp.Authorization.Users
         public virtual async Task<bool> IsGrantedAsync(long userId, Permission permission)
         {
             //Check for multi-tenancy side
-            if (!permission.MultiTenancySides.HasFlag(AbpSession.MultiTenancySide))
+            if (!permission.MultiTenancySides.HasFlag(GetCurrentMultiTenancySide()))
             {
                 return false;
             }
 
             //Check for depended features
-            if (permission.FeatureDependency != null && AbpSession.MultiTenancySide == MultiTenancySides.Tenant)
+            if (permission.FeatureDependency != null && GetCurrentMultiTenancySide() == MultiTenancySides.Tenant)
             {
+                FeatureDependencyContext.TenantId = GetCurrentTenantId();
+
                 if (!await permission.FeatureDependency.IsSatisfiedAsync(FeatureDependencyContext))
                 {
                     return false;
@@ -292,14 +314,24 @@ namespace Abp.Authorization.Users
             await UserPermissionStore.AddPermissionAsync(user, new PermissionGrantInfo(permission.Name, false));
         }
 
-        public virtual async Task<TUser> FindByNameOrEmailAsync(string userNameOrEmailAddress)
+        public virtual Task<TUser> FindByNameOrEmailAsync(string userNameOrEmailAddress)
         {
-            return await AbpStore.FindByNameOrEmailAsync(userNameOrEmailAddress);
+            return AbpUserStore.FindByNameOrEmailAsync(userNameOrEmailAddress);
         }
 
         public virtual Task<List<TUser>> FindAllAsync(UserLoginInfo login)
         {
-            return AbpStore.FindAllAsync(login);
+            return AbpUserStore.FindAllAsync(login);
+        }
+
+        public virtual Task<TUser> FindAsync(int? tenantId, UserLoginInfo login)
+        {
+            return AbpUserStore.FindAsync(tenantId, login);
+        }
+
+        public virtual Task<TUser> FindByNameOrEmailAsync(int? tenantId, string userNameOrEmailAddress)
+        {
+            return AbpUserStore.FindByNameOrEmailAsync(tenantId, userNameOrEmailAddress);
         }
 
         /// <summary>
@@ -368,7 +400,7 @@ namespace Abp.Authorization.Users
                 return IdentityResult.Failed(errors.ToArray());
             }
 
-            await AbpStore.SetPasswordHashAsync(user, PasswordHasher.HashPassword(user, newPassword));
+            await AbpUserStore.SetPasswordHashAsync(user, PasswordHasher.HashPassword(user, newPassword));
             return IdentityResult.Success;
         }
 
@@ -391,7 +423,7 @@ namespace Abp.Authorization.Users
 
         public virtual async Task<IdentityResult> SetRoles(TUser user, string[] roleNames)
         {
-            await AbpStore.UserRepository.EnsureCollectionLoadedAsync(user, u => u.Roles);
+            await AbpUserStore.UserRepository.EnsureCollectionLoadedAsync(user, u => u.Roles);
 
             //Remove from removed roles
             foreach (var userRole in user.Roles.ToList())
@@ -561,7 +593,7 @@ namespace Abp.Authorization.Users
 
         public virtual async Task InitializeOptionsAsync(int? tenantId)
         {
-            Options = new IdentityOptions();
+            Options = JsonConvert.DeserializeObject<IdentityOptions>(_optionsAccessor.Value.ToJsonString());
 
             //Lockout
             Options.Lockout.AllowedForNewUsers = await IsTrueAsync(AbpZeroSettingNames.UserManagement.UserLockOut.IsEnabled, tenantId);
@@ -578,7 +610,7 @@ namespace Abp.Authorization.Users
 
         protected virtual Task<string> GetOldUserNameAsync(long userId)
         {
-            return AbpStore.GetUserNameFromDatabaseAsync(userId);
+            return AbpUserStore.GetUserNameFromDatabaseAsync(userId);
         }
 
         private async Task<UserPermissionCacheItem> GetUserPermissionCacheItemAsync(long userId)
@@ -663,9 +695,14 @@ namespace Abp.Authorization.Users
                 : _settingManager.GetSettingValueForTenantAsync<T>(settingName, tenantId.Value);
         }
 
-        private string L(string name)
+        protected virtual string L(string name)
         {
-            return LocalizationManager.GetString(AbpZeroConsts.LocalizationSourceName, name);
+            return LocalizationManager.GetString(LocalizationSourceName, name);
+        }
+
+        protected virtual string L(string name, CultureInfo cultureInfo)
+        {
+            return LocalizationManager.GetString(LocalizationSourceName, name, cultureInfo);
         }
 
         private int? GetCurrentTenantId()
@@ -676,6 +713,43 @@ namespace Abp.Authorization.Users
             }
 
             return AbpSession.TenantId;
+        }
+
+        private MultiTenancySides GetCurrentMultiTenancySide()
+        {
+            if (_unitOfWorkManager.Current != null)
+            {
+                return MultiTenancy.IsEnabled && !_unitOfWorkManager.Current.GetTenantId().HasValue
+                    ? MultiTenancySides.Host
+                    : MultiTenancySides.Tenant;
+            }
+
+            return AbpSession.MultiTenancySide;
+        }
+
+        public virtual async Task AddTokenValidityKeyAsync(
+            TUser user,
+            string tokenValidityKey,
+            DateTime expireDate,
+            CancellationToken cancellationToken = default(CancellationToken))
+        {
+            await AbpUserStore.AddTokenValidityKeyAsync(user, tokenValidityKey, expireDate, cancellationToken);
+        }
+
+        public virtual async Task<bool> IsTokenValidityKeyValidAsync(
+            TUser user,
+            string tokenValidityKey,
+            CancellationToken cancellationToken = default(CancellationToken))
+        {
+            return await AbpUserStore.IsTokenValidityKeyValidAsync(user, tokenValidityKey, cancellationToken);
+        }
+
+        public virtual async Task RemoveTokenValidityKeyAsync(
+            TUser user,
+            string tokenValidityKey,
+            CancellationToken cancellationToken = default(CancellationToken))
+        {
+            await AbpUserStore.RemoveTokenValidityKeyAsync(user, tokenValidityKey, cancellationToken);
         }
     }
 }
